@@ -1,7 +1,7 @@
 use crate::models::{
-    AuthSpec, Collection, CookieRecord, Environment, Folder, HISTORY_LIMIT, HistoryEntry,
-    HttpRequestRecord, KvRow, PERSONAL_WORKSPACE_ID, RequestBody, Secret, WEBHOOK_LIMIT,
-    WebhookEvent, Workspace,
+    AppSettings, AuthSpec, Collection, CookieRecord, Environment, Folder, HISTORY_LIMIT,
+    HistoryEntry, HttpRequestRecord, KvRow, PERSONAL_WORKSPACE_ID, RequestBody, ResponseSnapshot,
+    Secret, WEBHOOK_LIMIT, WebhookEvent, Workspace,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -105,6 +105,19 @@ pub fn init(conn: &Connection) -> Result<(), String> {
             http_only INTEGER NOT NULL DEFAULT 0,
             UNIQUE (workspace_id, domain, path, name),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS response_snapshots (
+            request_id TEXT PRIMARY KEY,
+            status INTEGER NOT NULL,
+            headers TEXT NOT NULL,
+            body TEXT NOT NULL,
+            encoding TEXT NOT NULL,
+            content_type TEXT,
+            at TEXT NOT NULL
         );
         "#,
     )
@@ -811,6 +824,94 @@ pub fn clear_cookies(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "DELETE FROM cookies WHERE workspace_id = ?1",
         params![PERSONAL_WORKSPACE_ID],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str, default: &str) -> Result<String, String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+    .map(|v| v.unwrap_or_else(|| default.to_string()))
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn get_app_settings(conn: &Connection) -> Result<AppSettings, String> {
+    Ok(AppSettings {
+        plan: get_setting(conn, "plan", "local")?,
+        git_folder: get_setting(conn, "gitFolder", "")?,
+    })
+}
+
+pub fn save_app_settings(conn: &Connection, settings: &AppSettings) -> Result<(), String> {
+    let plan = if settings.plan == "pro" { "pro" } else { "local" };
+    set_setting(conn, "plan", plan)?;
+    set_setting(conn, "gitFolder", &settings.git_folder)?;
+    Ok(())
+}
+
+pub fn get_snapshot(conn: &Connection, request_id: &str) -> Result<Option<ResponseSnapshot>, String> {
+    conn.query_row(
+        "SELECT request_id, status, headers, body, encoding, content_type, at
+         FROM response_snapshots WHERE request_id = ?1",
+        params![request_id],
+        |r| {
+            let headers: String = r.get(2)?;
+            Ok(ResponseSnapshot {
+                request_id: r.get(0)?,
+                status: r.get::<_, i64>(1)? as u16,
+                headers: serde_json::from_str(&headers).unwrap_or_default(),
+                body: r.get(3)?,
+                encoding: r.get(4)?,
+                content_type: r.get(5)?,
+                at: r.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+pub fn upsert_snapshot(conn: &Connection, snap: &ResponseSnapshot) -> Result<(), String> {
+    let body = if snap.body.len() > crate::models::MAX_BODY_BYTES {
+        snap.body[..crate::models::MAX_BODY_BYTES].to_string()
+    } else {
+        snap.body.clone()
+    };
+    conn.execute(
+        "INSERT INTO response_snapshots
+            (request_id, status, headers, body, encoding, content_type, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(request_id) DO UPDATE SET
+            status = excluded.status,
+            headers = excluded.headers,
+            body = excluded.body,
+            encoding = excluded.encoding,
+            content_type = excluded.content_type,
+            at = excluded.at",
+        params![
+            snap.request_id,
+            snap.status as i64,
+            serde_json::to_string(&snap.headers).unwrap(),
+            body,
+            snap.encoding,
+            snap.content_type,
+            snap.at
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

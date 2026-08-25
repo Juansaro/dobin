@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useAppStore } from "@/store/useAppStore";
+import { isTauri, useAppStore } from "@/store/useAppStore";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { KeyValueEditor } from "@/features/request/KeyValueEditor";
@@ -10,7 +10,7 @@ import { runCollectionExport, runCollectionImport } from "@/features/collections
 import { toast } from "sonner";
 import { Textarea } from "@/ui/input";
 import { Modal } from "@/ui/badge";
-
+import { Features, getEntitlements } from "@/core/entitlements";
 export function SettingsView() {
   const environments = useAppStore((s) => s.environments);
   const saveEnvironment = useAppStore((s) => s.saveEnvironment);
@@ -66,6 +66,8 @@ export function SettingsView() {
             Datos locales en este PC. Sin cuenta ni internet obligatorio.
           </p>
         </section>
+
+        <PlanAndGitSettings />
 
         <section className="space-y-3">
           <h2 className="text-sm font-semibold">Globales</h2>
@@ -248,6 +250,98 @@ export function SettingsView() {
         />
       </Modal>
     </div>
+  );
+}
+
+function PlanAndGitSettings() {
+  const plan = useAppStore((s) => s.plan);
+  const setPlan = useAppStore((s) => s.setPlan);
+  const gitFolder = useAppStore((s) => s.gitFolder);
+  const linkGitFolder = useAppStore((s) => s.linkGitFolder);
+  const unlinkGitFolder = useAppStore((s) => s.unlinkGitFolder);
+  const syncGitNow = useAppStore((s) => s.syncGitNow);
+  const canTunnel = getEntitlements(plan).can(Features.WebhooksPublicTunnel);
+
+  return (
+    <>
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold">Plan en este PC</h2>
+        <p className="text-xs text-muted">
+          Local: inbox en 127.0.0.1. Pro (dev): desbloquea el túnel público. Sin
+          pasarela de pago.
+        </p>
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            variant={plan === "local" ? "default" : "outline"}
+            onClick={() => void setPlan("local")}
+          >
+            Local
+          </Button>
+          <Button
+            size="sm"
+            variant={plan === "pro" ? "default" : "outline"}
+            onClick={() => void setPlan("pro")}
+          >
+            Pro (dev)
+          </Button>
+        </div>
+        <p className="text-[11px] text-muted">
+          Túnel público: {canTunnel ? "desbloqueado" : "bloqueado"}
+        </p>
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold">Carpeta Git</h2>
+        <p className="text-xs text-muted">
+          Colecciones como ficheros (estilo Bruno). Los secretos no se escriben.
+          Commit y push los haces tú con git.
+        </p>
+        <p className="truncate font-mono text-[12px] text-muted">
+          {gitFolder || "Sin carpeta vinculada"}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!isTauri()}
+            onClick={() =>
+              void linkGitFolder()
+                .then((result) => {
+                  if (result.message) toast.success(result.message);
+                })
+                .catch((err: Error) => toast.error(err.message))
+            }
+          >
+            Vincular carpeta
+          </Button>
+          {gitFolder ? (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  void syncGitNow()
+                    .then((result) => toast.success(result.message))
+                    .catch((err: Error) => toast.error(err.message))
+                }
+              >
+                Sincronizar ahora
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  void unlinkGitFolder().then(() => toast.success("Carpeta desvinculada"))
+                }
+              >
+                Desvincular
+              </Button>
+            </>
+          ) : null}
+        </div>
+      </section>
+    </>
   );
 }
 

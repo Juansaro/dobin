@@ -1,17 +1,21 @@
 mod cookies;
 mod db;
+mod gitsync;
 mod http;
 mod models;
 mod oauth;
+mod tunnel;
 mod webhook;
 
 use models::{
-    Collection, CookieRecord, Environment, Folder, HistoryEntry, HttpRequestRecord, HttpSendPayload,
-    HttpSendResult, OauthParams, OauthTokens, Secret, WebhookEvent, WebhookStatus, Workspace,
+    AppSettings, Collection, CookieRecord, Environment, Folder, GitSyncResult, HistoryEntry,
+    HttpRequestRecord, HttpSendPayload, HttpSendResult, OauthParams, OauthTokens, ResponseSnapshot,
+    Secret, WebhookEvent, WebhookStatus, Workspace,
 };
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +25,8 @@ pub struct AppState {
     db: Arc<Mutex<Connection>>,
     cancels: Mutex<HashMap<String, CancellationToken>>,
     webhook: Mutex<Option<webhook::WebhookHandle>>,
+    tunnel: Mutex<Option<tunnel::TunnelHandle>>,
+    git_mtime: Mutex<u64>,
 }
 
 impl AppState {
@@ -29,11 +35,57 @@ impl AppState {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let conn = Connection::open(dir.join("opendobin.db")).map_err(|e| e.to_string())?;
         db::init(&conn)?;
+        let git_mtime = {
+            let folder = db::get_setting(&conn, "gitFolder", "").unwrap_or_default();
+            if folder.is_empty() {
+                0
+            } else {
+                let path = std::path::Path::new(&folder);
+                if gitsync::has_workspace_file(path) {
+                    gitsync::import_all(&conn, path).unwrap_or_else(|_| gitsync::max_mtime(path))
+                } else {
+                    gitsync::max_mtime(path)
+                }
+            }
+        };
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             cancels: Mutex::new(HashMap::new()),
             webhook: Mutex::new(None),
+            tunnel: Mutex::new(None),
+            git_mtime: Mutex::new(git_mtime),
         })
+    }
+}
+
+fn merge_webhook_status(state: &AppState) -> WebhookStatus {
+    let mut status = webhook::current_status(state.webhook.lock().as_ref());
+    if let Some(tunnel) = state.tunnel.lock().as_ref() {
+        status.public_url = tunnel.public_url.clone();
+        status.tunnel_running = true;
+        status.tunnel_error.clear();
+    }
+    status
+}
+
+fn stop_tunnel(state: &AppState) {
+    if let Some(handle) = state.tunnel.lock().take() {
+        handle.stop();
+    }
+}
+
+fn git_folder(state: &AppState) -> String {
+    db::get_setting(&state.db.lock(), "gitFolder", "").unwrap_or_default()
+}
+
+fn maybe_git_export(state: &AppState) {
+    let folder = git_folder(state);
+    if folder.is_empty() {
+        return;
+    }
+    match gitsync::export_all(&state.db.lock(), std::path::Path::new(&folder)) {
+        Ok(mtime) => *state.git_mtime.lock() = mtime,
+        Err(err) => eprintln!("git export: {err}"),
     }
 }
 
@@ -44,7 +96,9 @@ fn workspace_get(state: State<AppState>) -> Result<Workspace, String> {
 
 #[tauri::command]
 fn workspace_save(state: State<AppState>, workspace: Workspace) -> Result<(), String> {
-    db::save_workspace(&state.db.lock(), &workspace)
+    db::save_workspace(&state.db.lock(), &workspace)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -54,12 +108,16 @@ fn collection_list(state: State<AppState>) -> Result<Vec<Collection>, String> {
 
 #[tauri::command]
 fn collection_save(state: State<AppState>, collection: Collection) -> Result<(), String> {
-    db::save_collection(&state.db.lock(), &collection)
+    db::save_collection(&state.db.lock(), &collection)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn collection_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    db::delete_collection(&state.db.lock(), &id)
+    db::delete_collection(&state.db.lock(), &id)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -69,12 +127,16 @@ fn folder_list(state: State<AppState>) -> Result<Vec<Folder>, String> {
 
 #[tauri::command]
 fn folder_save(state: State<AppState>, folder: Folder) -> Result<(), String> {
-    db::save_folder(&state.db.lock(), &folder)
+    db::save_folder(&state.db.lock(), &folder)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn folder_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    db::delete_folder(&state.db.lock(), &id)
+    db::delete_folder(&state.db.lock(), &id)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -89,12 +151,16 @@ fn request_get(state: State<AppState>, id: String) -> Result<Option<HttpRequestR
 
 #[tauri::command]
 fn request_save(state: State<AppState>, request: HttpRequestRecord) -> Result<(), String> {
-    db::save_request(&state.db.lock(), &request)
+    db::save_request(&state.db.lock(), &request)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn request_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    db::delete_request(&state.db.lock(), &id)
+    db::delete_request(&state.db.lock(), &id)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -104,17 +170,23 @@ fn environment_list(state: State<AppState>) -> Result<Vec<Environment>, String> 
 
 #[tauri::command]
 fn environment_save(state: State<AppState>, environment: Environment) -> Result<(), String> {
-    db::save_environment(&state.db.lock(), &environment)
+    db::save_environment(&state.db.lock(), &environment)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn environment_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    db::delete_environment(&state.db.lock(), &id)
+    db::delete_environment(&state.db.lock(), &id)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn environment_set_active(state: State<AppState>, id: String) -> Result<(), String> {
-    db::set_active_environment(&state.db.lock(), &id)
+    db::set_active_environment(&state.db.lock(), &id)?;
+    maybe_git_export(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -315,7 +387,7 @@ fn http_cancel(state: State<AppState>, id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn webhook_status(state: State<AppState>) -> WebhookStatus {
-    webhook::current_status(state.webhook.lock().as_ref())
+    merge_webhook_status(&state)
 }
 
 #[tauri::command]
@@ -324,13 +396,13 @@ async fn webhook_start(
     state: State<'_, AppState>,
     port: u16,
 ) -> Result<WebhookStatus, String> {
-    if let Some(current) = state.webhook.lock().as_ref() {
-        return Ok(webhook::current_status(Some(current)));
+    if state.webhook.lock().is_some() {
+        return Ok(merge_webhook_status(&state));
     }
     let db = state.db.clone();
-    let (handle, status) = webhook::start(app, db, port).await?;
+    let (handle, _status) = webhook::start(app, db, port).await?;
     *state.webhook.lock() = Some(handle);
-    Ok(status)
+    Ok(merge_webhook_status(&state))
 }
 
 #[tauri::command]
@@ -338,7 +410,42 @@ fn webhook_stop(state: State<AppState>) -> Result<WebhookStatus, String> {
     if let Some(handle) = state.webhook.lock().take() {
         handle.cancel.cancel();
     }
-    Ok(webhook::current_status(None))
+    stop_tunnel(&state);
+    Ok(merge_webhook_status(&state))
+}
+
+#[tauri::command]
+async fn webhook_tunnel_start(state: State<'_, AppState>) -> Result<WebhookStatus, String> {
+    let settings = db::get_app_settings(&state.db.lock())?;
+    if settings.plan != "pro" {
+        return Err("El túnel público es una función Pro. Actívalo en Planes o Ajustes.".into());
+    }
+    let port = state
+        .webhook
+        .lock()
+        .as_ref()
+        .map(|h| h.port)
+        .ok_or_else(|| "Arranca el inbox local antes de abrir el túnel.".to_string())?;
+    if state.tunnel.lock().is_some() {
+        return Ok(merge_webhook_status(&state));
+    }
+    match tunnel::start(port).await {
+        Ok(handle) => {
+            *state.tunnel.lock() = Some(handle);
+            Ok(merge_webhook_status(&state))
+        }
+        Err(err) => {
+            let mut status = merge_webhook_status(&state);
+            status.tunnel_error = err.clone();
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+fn webhook_tunnel_stop(state: State<AppState>) -> Result<WebhookStatus, String> {
+    stop_tunnel(&state);
+    Ok(merge_webhook_status(&state))
 }
 
 #[tauri::command]
@@ -349,6 +456,142 @@ fn webhook_events(state: State<AppState>) -> Result<Vec<WebhookEvent>, String> {
 #[tauri::command]
 fn webhook_clear(state: State<AppState>) -> Result<(), String> {
     db::clear_webhooks(&state.db.lock())
+}
+
+#[tauri::command]
+fn settings_get(state: State<AppState>) -> Result<AppSettings, String> {
+    db::get_app_settings(&state.db.lock())
+}
+
+#[tauri::command]
+fn settings_save(state: State<AppState>, settings: AppSettings) -> Result<AppSettings, String> {
+    if settings.plan != "pro" && state.tunnel.lock().is_some() {
+        stop_tunnel(&state);
+    }
+    db::save_app_settings(&state.db.lock(), &settings)?;
+    db::get_app_settings(&state.db.lock())
+}
+
+#[tauri::command]
+fn snapshot_get(state: State<AppState>, id: String) -> Result<Option<ResponseSnapshot>, String> {
+    db::get_snapshot(&state.db.lock(), &id)
+}
+
+#[tauri::command]
+fn snapshot_put(state: State<AppState>, snapshot: ResponseSnapshot) -> Result<(), String> {
+    db::upsert_snapshot(&state.db.lock(), &snapshot)
+}
+
+#[tauri::command]
+async fn git_folder_pick() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Carpeta Git de openDobin")
+            .pick_folder()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn git_folder_link(state: State<AppState>, folder: String) -> Result<GitSyncResult, String> {
+    let path = PathBuf::from(&folder);
+    if !path.is_dir() {
+        return Err("Esa ruta no es una carpeta.".into());
+    }
+    let imported = gitsync::has_workspace_file(&path);
+    let mtime = if imported {
+        gitsync::import_all(&state.db.lock(), &path)?
+    } else {
+        gitsync::export_all(&state.db.lock(), &path)?
+    };
+    *state.git_mtime.lock() = mtime;
+    let mut settings = db::get_app_settings(&state.db.lock())?;
+    settings.git_folder = folder.clone();
+    db::save_app_settings(&state.db.lock(), &settings)?;
+    Ok(GitSyncResult {
+        folder,
+        imported,
+        exported: !imported,
+        changed: imported,
+        message: if imported {
+            "Carpeta vinculada. Se importaron los ficheros.".into()
+        } else {
+            "Carpeta vinculada. Se escribieron las colecciones actuales.".into()
+        },
+    })
+}
+
+#[tauri::command]
+fn git_folder_unlink(state: State<AppState>) -> Result<AppSettings, String> {
+    let mut settings = db::get_app_settings(&state.db.lock())?;
+    settings.git_folder = String::new();
+    db::save_app_settings(&state.db.lock(), &settings)?;
+    *state.git_mtime.lock() = 0;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn git_sync_now(state: State<AppState>) -> Result<GitSyncResult, String> {
+    let folder = git_folder(&state);
+    if folder.is_empty() {
+        return Err("No hay carpeta Git vinculada.".into());
+    }
+    let path = PathBuf::from(&folder);
+    let mtime = gitsync::export_all(&state.db.lock(), &path)?;
+    *state.git_mtime.lock() = mtime;
+    Ok(GitSyncResult {
+        folder,
+        imported: false,
+        exported: true,
+        changed: false,
+        message: "Colecciones escritas en la carpeta Git.".into(),
+    })
+}
+
+#[tauri::command]
+fn git_sync_poll(state: State<AppState>) -> Result<GitSyncResult, String> {
+    let folder = git_folder(&state);
+    if folder.is_empty() {
+        return Ok(GitSyncResult {
+            folder: String::new(),
+            imported: false,
+            exported: false,
+            changed: false,
+            message: String::new(),
+        });
+    }
+    let path = PathBuf::from(&folder);
+    if !gitsync::has_workspace_file(&path) {
+        return Ok(GitSyncResult {
+            folder,
+            imported: false,
+            exported: false,
+            changed: false,
+            message: String::new(),
+        });
+    }
+    let disk = gitsync::max_mtime(&path);
+    let last = *state.git_mtime.lock();
+    if disk <= last {
+        return Ok(GitSyncResult {
+            folder,
+            imported: false,
+            exported: false,
+            changed: false,
+            message: String::new(),
+        });
+    }
+    gitsync::import_all(&state.db.lock(), &path)?;
+    *state.git_mtime.lock() = disk;
+    Ok(GitSyncResult {
+        folder,
+        imported: true,
+        exported: false,
+        changed: true,
+        message: "La carpeta Git cambió. Se actualizó el workspace.".into(),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -393,8 +636,19 @@ pub fn run() {
             webhook_status,
             webhook_start,
             webhook_stop,
+            webhook_tunnel_start,
+            webhook_tunnel_stop,
             webhook_events,
-            webhook_clear
+            webhook_clear,
+            settings_get,
+            settings_save,
+            snapshot_get,
+            snapshot_put,
+            git_folder_pick,
+            git_folder_link,
+            git_folder_unlink,
+            git_sync_now,
+            git_sync_poll
         ])
         .run(tauri::generate_context!())
         .expect("error while running openDobin");

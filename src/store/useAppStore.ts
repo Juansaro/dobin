@@ -7,13 +7,17 @@ import type {
   Collection,
   CookieRecord,
   Environment,
+  EnvCompareResult,
   Folder,
+  GitSyncResult,
   HistoryEntry,
   HttpRequestRecord,
   HttpSendResult,
   KvRow,
   OauthTokens,
+  ResponseSnapshot,
   Secret,
+  AppSettings,
   View,
   WebhookEvent,
   WebhookStatus,
@@ -26,6 +30,8 @@ import {
   hydrateRequest,
   PERSONAL_WORKSPACE_ID,
 } from "@/core/types";
+import { entitlementsFor, normalizePlan, Features, type PlanId } from "@/core/entitlements";
+import { requestFromWebhook } from "@/core/replay";
 import {
   buildImportedFolders,
   collectionFileName,
@@ -52,6 +58,10 @@ interface AppState {
   history: HistoryEntry[];
   webhookEvents: WebhookEvent[];
   webhookStatus: WebhookStatus;
+  plan: PlanId;
+  gitFolder: string;
+  lastSnapshot: ResponseSnapshot | null;
+  compare: EnvCompareResult | null;
   activeRequestId: string | null;
   draft: HttpRequestRecord | null;
   dirty: boolean;
@@ -97,9 +107,22 @@ interface AppState {
   replayHistory: (entry: HistoryEntry) => void;
   startWebhook: (port: number) => Promise<void>;
   stopWebhook: () => Promise<void>;
+  startTunnel: () => Promise<void>;
+  stopTunnel: () => Promise<void>;
   loadWebhooks: () => Promise<void>;
   clearWebhooks: () => Promise<void>;
   prependWebhook: (event: WebhookEvent) => void;
+  replayWebhook: (
+    event: WebhookEvent,
+    opts: { collectionId: string; url: string; createNew: boolean; sendNow: boolean },
+  ) => Promise<void>;
+  setPlan: (plan: PlanId) => Promise<void>;
+  linkGitFolder: () => Promise<GitSyncResult>;
+  unlinkGitFolder: () => Promise<void>;
+  syncGitNow: () => Promise<GitSyncResult>;
+  pollGit: () => Promise<void>;
+  compareEnvironments: (envAId: string, envBId: string) => Promise<void>;
+  clearCompare: () => void;
   exportCollection: (id: string) => void;
   importCollectionJson: (text: string) => Promise<string>;
 }
@@ -174,15 +197,19 @@ function upsertVar<T extends { variables: KvRow[]; updatedAt?: string }>(
   return { ...obj, variables: rows, updatedAt: new Date().toISOString() };
 }
 
-function currentVars(state: {
-  workspace: Workspace | null;
-  collections: Collection[];
-  environments: Environment[];
-  secrets: Secret[];
-  draft: HttpRequestRecord | null;
-}): Record<string, string> {
-  const env =
-    state.environments.find((item) => item.isActive) ?? state.environments[0];
+function varsForEnvironment(
+  state: {
+    workspace: Workspace | null;
+    collections: Collection[];
+    environments: Environment[];
+    secrets: Secret[];
+    draft: HttpRequestRecord | null;
+  },
+  envId?: string,
+): Record<string, string> {
+  const env = envId
+    ? state.environments.find((item) => item.id === envId)
+    : (state.environments.find((item) => item.isActive) ?? state.environments[0]);
   const collection = state.draft
     ? state.collections.find((item) => item.id === state.draft?.collectionId)
     : undefined;
@@ -192,6 +219,16 @@ function currentVars(state: {
     environment: env?.variables,
     secrets: state.secrets,
   });
+}
+
+function currentVars(state: {
+  workspace: Workspace | null;
+  collections: Collection[];
+  environments: Environment[];
+  secrets: Secret[];
+  draft: HttpRequestRecord | null;
+}): Record<string, string> {
+  return varsForEnvironment(state);
 }
 
 function enabledPairs(rows: KvRow[], vars: Record<string, string>): [string, string][] {
@@ -249,6 +286,64 @@ function buildBody(
   };
 }
 
+function interpolateAuth(draft: HttpRequestRecord, vars: Record<string, string>) {
+  return {
+    ...emptyAuth(),
+    ...draft.auth,
+    token: interpolate(draft.auth.token, vars),
+    username: interpolate(draft.auth.username, vars),
+    password: interpolate(draft.auth.password, vars),
+    keyName: interpolate(draft.auth.keyName, vars),
+    clientId: interpolate(draft.auth.clientId, vars),
+    clientSecret: interpolate(draft.auth.clientSecret, vars),
+    accessToken: interpolate(draft.auth.accessToken, vars),
+    refreshToken: interpolate(draft.auth.refreshToken, vars),
+    tokenUrl: interpolate(draft.auth.tokenUrl, vars),
+    authorizeUrl: interpolate(draft.auth.authorizeUrl, vars),
+  };
+}
+
+function assembledSend(
+  draft: HttpRequestRecord,
+  vars: Record<string, string>,
+  timeoutMs: number,
+  followRedirects: boolean,
+  acceptInvalidCerts: boolean,
+) {
+  const url = buildUrl(draft.url, draft.query, vars);
+  const { body, extraHeaders } = buildBody(draft, vars);
+  const headers = enabledPairs(draft.headers, vars);
+  for (const [key, value] of extraHeaders) {
+    const exists = headers.some(([k]) => k.toLowerCase() === key.toLowerCase());
+    if (!exists) headers.push([key, value]);
+  }
+  return {
+    method: draft.method,
+    url,
+    headers,
+    body,
+    timeoutMs,
+    followRedirects,
+    acceptInvalidCerts,
+    auth: interpolateAuth(draft, vars),
+    workspaceId: draft.workspaceId,
+    requestId: draft.id,
+  };
+}
+
+async function reloadLists() {
+  const [workspace, collections, folders, requests, environments, secrets] =
+    await Promise.all([
+      api<Workspace>("workspace_get"),
+      api<Collection[]>("collection_list"),
+      api<Folder[]>("folder_list"),
+      api<HttpRequestRecord[]>("request_list"),
+      api<Environment[]>("environment_list"),
+      api<Secret[]>("secret_list"),
+    ]);
+  return { workspace, collections, folders, requests, environments, secrets };
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   error: null,
@@ -263,7 +358,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   cookies: [],
   history: [],
   webhookEvents: [],
-  webhookStatus: { running: false, port: 0, url: "" },
+  webhookStatus: {
+    running: false,
+    port: 0,
+    url: "",
+    publicUrl: "",
+    tunnelRunning: false,
+    tunnelError: "",
+  },
+  plan: "local",
+  gitFolder: "",
+  lastSnapshot: null,
+  compare: null,
   activeRequestId: null,
   draft: null,
   dirty: false,
@@ -277,7 +383,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   bootstrap: async () => {
     try {
-      const [workspace, collections, folders, requests, environments, secrets, cookies, history, webhookEvents, webhookStatus] =
+      const [workspace, collections, folders, requests, environments, secrets, cookies, history, webhookEvents, webhookStatus, settings] =
         await Promise.all([
           api<Workspace>("workspace_get"),
           api<Collection[]>("collection_list"),
@@ -289,9 +395,13 @@ export const useAppStore = create<AppState>((set, get) => ({
           api<HistoryEntry[]>("history_list"),
           api<WebhookEvent[]>("webhook_events"),
           api<WebhookStatus>("webhook_status"),
+          api<AppSettings>("settings_get"),
         ]);
       const hydrated = hydrateEnvs(environments, secrets);
       const first = requests[0] ?? null;
+      const lastSnapshot = first
+        ? await api<ResponseSnapshot | null>("snapshot_get", { id: first.id })
+        : null;
       set({
         workspace: hydrateWorkspace(
           { ...workspace, variables: workspace.variables ?? [] },
@@ -309,6 +419,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         history,
         webhookEvents,
         webhookStatus,
+        plan: normalizePlan(settings.plan),
+        gitFolder: settings.gitFolder ?? "",
+        lastSnapshot,
+        compare: null,
         activeRequestId: first?.id ?? null,
         draft: first ? hydrateRequest(structuredClone(first)) : null,
         ready: true,
@@ -336,7 +450,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       view: "request",
       response: null,
       assertionResults: [],
+      compare: null,
+      lastSnapshot: null,
     });
+    void api<ResponseSnapshot | null>("snapshot_get", { id }).then(
+      (lastSnapshot) => set({ lastSnapshot }),
+    );
   },
 
   patchDraft: (patch) => {
@@ -443,6 +562,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       dirty: false,
       view: "request",
       response: null,
+      lastSnapshot: null,
+      compare: null,
     });
   },
 
@@ -619,46 +740,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ workspace, collections, environments, secrets });
 
     const vars = currentVars(get());
-    const url = buildUrl(draft.url, draft.query, vars);
-    const { body, extraHeaders } = buildBody(draft, vars);
-    const headers = enabledPairs(draft.headers, vars);
-    for (const [key, value] of extraHeaders) {
-      const exists = headers.some(
-        ([k]) => k.toLowerCase() === key.toLowerCase(),
-      );
-      if (!exists) headers.push([key, value]);
-    }
-    const auth = {
-      ...emptyAuth(),
-      ...draft.auth,
-      token: interpolate(draft.auth.token, vars),
-      username: interpolate(draft.auth.username, vars),
-      password: interpolate(draft.auth.password, vars),
-      keyName: interpolate(draft.auth.keyName, vars),
-      clientId: interpolate(draft.auth.clientId, vars),
-      clientSecret: interpolate(draft.auth.clientSecret, vars),
-      accessToken: interpolate(draft.auth.accessToken, vars),
-      refreshToken: interpolate(draft.auth.refreshToken, vars),
-      tokenUrl: interpolate(draft.auth.tokenUrl, vars),
-      authorizeUrl: interpolate(draft.auth.authorizeUrl, vars),
-    };
+    const payload = assembledSend(
+      draft,
+      vars,
+      get().timeoutMs,
+      get().followRedirects,
+      get().acceptInvalidCerts,
+    );
     const sendId = crypto.randomUUID();
-    set({ sending: true, sendId, response: null, assertionResults: [] });
-    const result = await api<HttpSendResult>("http_send", {
-      payload: {
-        id: sendId,
-        method: draft.method,
-        url,
-        headers,
-        body,
-        timeoutMs: get().timeoutMs,
-        followRedirects: get().followRedirects,
-        acceptInvalidCerts: get().acceptInvalidCerts,
-        auth,
-        workspaceId: draft.workspaceId,
-        requestId: draft.id,
-      },
+    set({ sending: true, sendId, response: null, assertionResults: [], compare: null });
+    const previous = await api<ResponseSnapshot | null>("snapshot_get", {
+      id: draft.id,
     });
+    const result = await api<HttpSendResult>("http_send", {
+      payload: { ...payload, id: sendId },
+    });
+    if (result.status === 200 && !result.truncated) {
+      await api("snapshot_put", {
+        snapshot: {
+          requestId: draft.id,
+          status: 200,
+          headers: result.headers,
+          body: result.body,
+          encoding: result.bodyEncoding,
+          contentType: result.contentType,
+          at: new Date().toISOString(),
+        },
+      });
+    }
     const assertionResults = runAssertions(draft.tests ?? [], result, vars);
     const [history, cookies, requests] = await Promise.all([
       api<HistoryEntry[]>("history_list"),
@@ -671,6 +780,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       sending: false,
       sendId: null,
       response: result,
+      lastSnapshot: previous,
       assertionResults,
       history,
       cookies,
@@ -749,6 +859,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ webhookStatus });
   },
 
+  startTunnel: async () => {
+    if (!entitlementsFor(get().plan).can(Features.WebhooksPublicTunnel)) {
+      throw new Error("El túnel público es una función Pro.");
+    }
+    const webhookStatus = await api<WebhookStatus>("webhook_tunnel_start");
+    set({ webhookStatus });
+  },
+
+  stopTunnel: async () => {
+    const webhookStatus = await api<WebhookStatus>("webhook_tunnel_stop");
+    set({ webhookStatus });
+  },
+
   loadWebhooks: async () => {
     const [webhookEvents, webhookStatus] = await Promise.all([
       api<WebhookEvent[]>("webhook_events"),
@@ -767,6 +890,205 @@ export const useAppStore = create<AppState>((set, get) => ({
       webhookEvents: [event, ...state.webhookEvents.filter((e) => e.id !== event.id)].slice(0, 200),
     }));
   },
+
+  replayWebhook: async (event, opts) => {
+    const built = requestFromWebhook(
+      event,
+      PERSONAL_WORKSPACE_ID,
+      opts.collectionId,
+      opts.url,
+    );
+    if (opts.createNew) {
+      await api("request_save", { request: built });
+      const requests = await api<HttpRequestRecord[]>("request_list");
+      set({
+        requests,
+        activeRequestId: built.id,
+        draft: built,
+        dirty: false,
+        view: "request",
+        response: null,
+        lastSnapshot: null,
+        compare: null,
+      });
+    } else {
+      const draft = get().draft;
+      if (!draft) {
+        await api("request_save", { request: built });
+        const requests = await api<HttpRequestRecord[]>("request_list");
+        set({
+          requests,
+          activeRequestId: built.id,
+          draft: built,
+          dirty: false,
+          view: "request",
+        });
+      } else {
+        set({
+          draft: {
+            ...draft,
+            method: built.method,
+            url: built.url,
+            headers: built.headers,
+            body: built.body,
+            updatedAt: new Date().toISOString(),
+          },
+          dirty: true,
+          view: "request",
+        });
+      }
+    }
+    if (opts.sendNow) {
+      await get().send();
+    }
+  },
+
+  setPlan: async (plan) => {
+    const next = normalizePlan(plan);
+    const settings = await api<AppSettings>("settings_save", {
+      settings: { plan: next, gitFolder: get().gitFolder },
+    });
+    const webhookStatus = await api<WebhookStatus>("webhook_status");
+    set({ plan: normalizePlan(settings.plan), webhookStatus });
+  },
+
+  linkGitFolder: async () => {
+    const picked = await api<string | null>("git_folder_pick");
+    if (!picked) {
+      return {
+        folder: get().gitFolder,
+        imported: false,
+        exported: false,
+        changed: false,
+        message: "",
+      };
+    }
+    const result = await api<GitSyncResult>("git_folder_link", { folder: picked });
+    const lists = await reloadLists();
+    const secrets = lists.secrets;
+    set({
+      gitFolder: result.folder,
+      workspace: hydrateWorkspace(lists.workspace, secrets),
+      collections: hydrateCollections(lists.collections, secrets),
+      folders: lists.folders,
+      requests: lists.requests,
+      environments: hydrateEnvs(lists.environments, secrets),
+      secrets,
+    });
+    return result;
+  },
+
+  unlinkGitFolder: async () => {
+    const settings = await api<AppSettings>("git_folder_unlink");
+    set({ gitFolder: settings.gitFolder ?? "" });
+  },
+
+  syncGitNow: async () => {
+    return api<GitSyncResult>("git_sync_now");
+  },
+
+  pollGit: async () => {
+    if (!get().gitFolder) return;
+    const result = await api<GitSyncResult>("git_sync_poll");
+    if (!result.changed) return;
+    const lists = await reloadLists();
+    const secrets = lists.secrets;
+    const dirty = get().dirty;
+    const activeId = get().activeRequestId;
+    const updated = lists.requests.find((item) => item.id === activeId);
+    set({
+      workspace: hydrateWorkspace(lists.workspace, secrets),
+      collections: hydrateCollections(lists.collections, secrets),
+      folders: lists.folders,
+      requests: lists.requests,
+      environments: hydrateEnvs(lists.environments, secrets),
+      secrets,
+      draft:
+        dirty || !updated
+          ? get().draft
+          : hydrateRequest(structuredClone(updated)),
+    });
+    const { toast } = await import("sonner");
+    toast.message(result.message || "Carpeta Git actualizada");
+  },
+
+  compareEnvironments: async (envAId, envBId) => {
+    const draft = get().draft;
+    if (!draft || get().sending) return;
+    const activeId =
+      get().environments.find((item) => item.isActive)?.id ?? get().environments[0]?.id;
+    const varsA = varsForEnvironment(get(), envAId);
+    const varsB = varsForEnvironment(get(), envBId);
+    const sendIdA = crypto.randomUUID();
+    set({ sending: true, sendId: sendIdA, compare: null });
+    const resultA = await api<HttpSendResult>("http_send", {
+      payload: {
+        ...assembledSend(
+          draft,
+          varsA,
+          get().timeoutMs,
+          get().followRedirects,
+          get().acceptInvalidCerts,
+        ),
+        id: sendIdA,
+      },
+    });
+    const sendIdB = crypto.randomUUID();
+    set({ sendId: sendIdB });
+    const resultB = await api<HttpSendResult>("http_send", {
+      payload: {
+        ...assembledSend(
+          draft,
+          varsB,
+          get().timeoutMs,
+          get().followRedirects,
+          get().acceptInvalidCerts,
+        ),
+        id: sendIdB,
+      },
+    });
+    if (activeId === envAId && resultA.status === 200 && !resultA.truncated) {
+      await api("snapshot_put", {
+        snapshot: {
+          requestId: draft.id,
+          status: 200,
+          headers: resultA.headers,
+          body: resultA.body,
+          encoding: resultA.bodyEncoding,
+          contentType: resultA.contentType,
+          at: new Date().toISOString(),
+        },
+      });
+    } else if (activeId === envBId && resultB.status === 200 && !resultB.truncated) {
+      await api("snapshot_put", {
+        snapshot: {
+          requestId: draft.id,
+          status: 200,
+          headers: resultB.headers,
+          body: resultB.body,
+          encoding: resultB.bodyEncoding,
+          contentType: resultB.contentType,
+          at: new Date().toISOString(),
+        },
+      });
+    }
+    const history = await api<HistoryEntry[]>("history_list");
+    set({
+      sending: false,
+      sendId: null,
+      history,
+      compare: {
+        envAId,
+        envBId,
+        resultA,
+        resultB,
+        assertionsA: runAssertions(draft.tests ?? [], resultA, varsA),
+        assertionsB: runAssertions(draft.tests ?? [], resultB, varsB),
+      },
+    });
+  },
+
+  clearCompare: () => set({ compare: null }),
 
   exportCollection: (id) => {
     const { collections, requests, folders, environments } = get();

@@ -4,11 +4,14 @@ import type {
   CookieRecord,
   Environment,
   Folder,
+  GitSyncResult,
   HistoryEntry,
   HttpRequestRecord,
   HttpSendPayload,
   HttpSendResult,
+  ResponseSnapshot,
   Secret,
+  AppSettings,
   WebhookEvent,
   WebhookStatus,
   Workspace,
@@ -123,11 +126,14 @@ function seedMemory(): Memory {
     cookies: [],
     history: [],
     webhooks: [],
-    webhookStatus: { running: false, port: 0, url: "" },
+    webhookStatus: { running: false, port: 0, url: "", publicUrl: "", tunnelRunning: false, tunnelError: "" },
   };
 }
 
 const memory = seedMemory();
+let memoryPlan: AppSettings["plan"] = "local";
+let memoryGitFolder = "";
+const memorySnapshots = new Map<string, ResponseSnapshot>();
 
 async function memoryInvoke<T>(
   cmd: string,
@@ -265,13 +271,61 @@ async function memoryInvoke<T>(
         "El inbox de webhooks solo está disponible en la app de escritorio.",
       );
     case "webhook_stop":
-      memory.webhookStatus = { running: false, port: 0, url: "" };
+      memory.webhookStatus = {
+        running: false,
+        port: 0,
+        url: "",
+        publicUrl: "",
+        tunnelRunning: false,
+        tunnelError: "",
+      };
+      return memory.webhookStatus as T;
+    case "webhook_tunnel_start":
+      throw new Error("El túnel público solo está disponible en la app de escritorio.");
+    case "webhook_tunnel_stop":
+      memory.webhookStatus = {
+        ...memory.webhookStatus,
+        publicUrl: "",
+        tunnelRunning: false,
+        tunnelError: "",
+      };
       return memory.webhookStatus as T;
     case "webhook_events":
       return memory.webhooks as T;
     case "webhook_clear":
       memory.webhooks = [];
       return undefined as T;
+    case "settings_get":
+      return { plan: memoryPlan, gitFolder: memoryGitFolder } as T;
+    case "settings_save": {
+      const settings = args.settings as AppSettings;
+      memoryPlan = settings.plan === "pro" ? "pro" : "local";
+      memoryGitFolder = settings.gitFolder ?? memoryGitFolder;
+      return { plan: memoryPlan, gitFolder: memoryGitFolder } as T;
+    }
+    case "snapshot_get":
+      return (memorySnapshots.get(args.id as string) ?? null) as T;
+    case "snapshot_put": {
+      const snap = args.snapshot as ResponseSnapshot;
+      memorySnapshots.set(snap.requestId, snap);
+      return undefined as T;
+    }
+    case "git_folder_pick":
+      return null as T;
+    case "git_folder_link":
+      throw new Error("La carpeta Git solo se vincula en la app de escritorio.");
+    case "git_folder_unlink":
+      memoryGitFolder = "";
+      return { plan: memoryPlan, gitFolder: "" } as T;
+    case "git_sync_now":
+    case "git_sync_poll":
+      return {
+        folder: memoryGitFolder,
+        imported: false,
+        exported: false,
+        changed: false,
+        message: "",
+      } as GitSyncResult as T;
     default:
       throw new Error(`Comando no soportado en preview: ${cmd}`);
   }

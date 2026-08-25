@@ -2,7 +2,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { emptyAuth, METHODS } from "@/core/types";
-import type { AuthSpec } from "@/core/types";
+import type { AuthSpec, Environment, EnvCompareResult } from "@/core/types";
 import { CODE_TARGETS, generateCode, type CodeTarget } from "@/core/codegen";
 import { interpolate, resolveVars } from "@/core/interpolate";
 import { useAppStore } from "@/store/useAppStore";
@@ -14,6 +14,7 @@ import { KeyValueEditor } from "./KeyValueEditor";
 import { ResponsePanel } from "./ResponsePanel";
 import { TestsEditor } from "./TestsEditor";
 import { PreRequestEditor } from "./PreRequestEditor";
+import { DiffView } from "./DiffView";
 import { Modal } from "@/ui/badge";
 
 const tabs = ["params", "headers", "body", "auth", "pre", "tests"] as const;
@@ -42,11 +43,19 @@ export function RequestWorkbench() {
   const acceptInvalidCerts = useAppStore((s) => s.acceptInvalidCerts);
   const obtainToken = useAppStore((s) => s.obtainToken);
   const assertionResults = useAppStore((s) => s.assertionResults);
+  const lastSnapshot = useAppStore((s) => s.lastSnapshot);
+  const environments = useAppStore((s) => s.environments);
+  const compare = useAppStore((s) => s.compare);
+  const compareEnvironments = useAppStore((s) => s.compareEnvironments);
+  const clearCompare = useAppStore((s) => s.clearCompare);
   const [tab, setTab] = useState<Tab>("params");
   const [showOptions, setShowOptions] = useState(false);
   const [oauthBusy, setOauthBusy] = useState(false);
   const [codeOpen, setCodeOpen] = useState(false);
   const [codeTarget, setCodeTarget] = useState<CodeTarget>("fetch");
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [envA, setEnvA] = useState("");
+  const [envB, setEnvB] = useState("");
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -105,6 +114,20 @@ export function RequestWorkbench() {
         </Button>
         <Button variant="ghost" onClick={() => setCodeOpen(true)}>
           Código
+        </Button>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            const active =
+              environments.find((item) => item.isActive)?.id ?? environments[0]?.id ?? "";
+            const other =
+              environments.find((item) => item.id !== active)?.id ?? active;
+            setEnvA(active);
+            setEnvB(other);
+            setCompareOpen(true);
+          }}
+        >
+          Comparar
         </Button>
         <Button variant="ghost" onClick={() => setShowOptions((v) => !v)}>
           Opciones
@@ -269,17 +292,84 @@ export function RequestWorkbench() {
         </AnimatePresence>
       </div>
 
-      <ResponsePanel
-        result={response}
-        sending={sending}
-        assertionResults={assertionResults}
-      />
+      {compare ? (
+        <CompareSplit
+          compare={compare}
+          environments={environments}
+          sending={sending}
+          onClose={clearCompare}
+        />
+      ) : (
+        <ResponsePanel
+          result={response}
+          sending={sending}
+          assertionResults={assertionResults}
+          previousSnapshot={lastSnapshot}
+        />
+      )}
       <CodeModal
         open={codeOpen}
         target={codeTarget}
         onTarget={setCodeTarget}
         onClose={() => setCodeOpen(false)}
       />
+      <Modal
+        open={compareOpen}
+        title="Comparar entornos"
+        onClose={() => setCompareOpen(false)}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setCompareOpen(false)}>
+              Cancelar
+            </Button>
+            <Button
+              disabled={!envA || !envB || envA === envB || sending}
+              onClick={() => {
+                setCompareOpen(false);
+                void compareEnvironments(envA, envB).catch((err: Error) =>
+                  toast.error(err.message),
+                );
+              }}
+            >
+              Enviar a ambos
+            </Button>
+          </>
+        }
+      >
+        <p className="mb-3 text-xs text-muted">
+          Mismo request, dos interpolaciones. El entorno activo de la barra no cambia.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="space-y-1 text-xs">
+            Entorno A
+            <select
+              value={envA}
+              onChange={(e) => setEnvA(e.target.value)}
+              className="h-8 w-full rounded-md border border-line bg-background px-2 text-sm"
+            >
+              {environments.map((env) => (
+                <option key={env.id} value={env.id}>
+                  {env.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="space-y-1 text-xs">
+            Entorno B
+            <select
+              value={envB}
+              onChange={(e) => setEnvB(e.target.value)}
+              className="h-8 w-full rounded-md border border-line bg-background px-2 text-sm"
+            >
+              {environments.map((env) => (
+                <option key={env.id} value={env.id}>
+                  {env.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -475,6 +565,74 @@ function VarHint() {
       {colVars ? ` · ${colVars} vars de colección` : ""}
       {" · {{$guid}} {{$timestamp}} {{$nonce}}"}
     </div>
+  );
+}
+
+function CompareSplit({
+  compare,
+  environments,
+  sending,
+  onClose,
+}: {
+  compare: EnvCompareResult;
+  environments: Environment[];
+  sending: boolean;
+  onClose: () => void;
+}) {
+  const nameA =
+    environments.find((item) => item.id === compare.envAId)?.name ?? "A";
+  const nameB =
+    environments.find((item) => item.id === compare.envBId)?.name ?? "B";
+  return (
+    <section className="flex min-h-[260px] flex-1 flex-col border-t border-line bg-panel">
+      <div className="flex items-center justify-between border-b border-line px-3 py-2">
+        <span className="text-sm">
+          Comparación {nameA} vs {nameB}
+        </span>
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          Cerrar
+        </Button>
+      </div>
+      <div className="grid min-h-0 flex-1 grid-cols-2 divide-x divide-line overflow-hidden">
+        <div className="min-h-0 overflow-auto">
+          <ResponsePanel
+            result={compare.resultA}
+            sending={sending}
+            assertionResults={compare.assertionsA}
+            label={nameA}
+          />
+        </div>
+        <div className="min-h-0 overflow-auto">
+          <ResponsePanel
+            result={compare.resultB}
+            sending={sending}
+            assertionResults={compare.assertionsB}
+            previousSnapshot={{
+              requestId: "",
+              status: compare.resultA.status ?? 0,
+              headers: compare.resultA.headers,
+              body: compare.resultA.body,
+              encoding: compare.resultA.bodyEncoding,
+              contentType: compare.resultA.contentType,
+              at: "",
+            }}
+            label={nameB}
+          />
+        </div>
+      </div>
+      <div className="max-h-48 overflow-auto border-t border-line p-3" data-selectable>
+        <p className="mb-2 text-[11px] uppercase text-muted">Diff de body</p>
+        <DiffView
+          left={compare.resultA.body}
+          right={compare.resultB.body}
+          leftEncoding={compare.resultA.bodyEncoding}
+          rightEncoding={compare.resultB.bodyEncoding}
+          leftType={compare.resultA.contentType}
+          rightType={compare.resultB.contentType}
+          emptyLabel="Sin body en A"
+        />
+      </div>
+    </section>
   );
 }
 

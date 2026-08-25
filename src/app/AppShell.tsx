@@ -16,6 +16,8 @@ export function AppShell() {
   const ready = useAppStore((s) => s.ready);
   const error = useAppStore((s) => s.error);
   const prependWebhook = useAppStore((s) => s.prependWebhook);
+  const pollGit = useAppStore((s) => s.pollGit);
+  const gitFolder = useAppStore((s) => s.gitFolder);
   const [palette, setPalette] = useState(false);
 
   useEffect(() => {
@@ -33,6 +35,14 @@ export function AppShell() {
     });
     return () => unlisten?.();
   }, [prependWebhook]);
+
+  useEffect(() => {
+    if (!isTauri() || !gitFolder) return;
+    const timer = window.setInterval(() => {
+      void pollGit().catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [gitFolder, pollGit]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {

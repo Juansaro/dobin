@@ -33,11 +33,17 @@ pub fn current_status(handle: Option<&WebhookHandle>) -> WebhookStatus {
             running: true,
             port: h.port,
             url: format!("http://127.0.0.1:{}/hook", h.port),
+            public_url: String::new(),
+            tunnel_running: false,
+            tunnel_error: String::new(),
         },
         None => WebhookStatus {
             running: false,
             port: 0,
             url: String::new(),
+            public_url: String::new(),
+            tunnel_running: false,
+            tunnel_error: String::new(),
         },
     }
 }

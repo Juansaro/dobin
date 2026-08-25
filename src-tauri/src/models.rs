@@ -333,6 +333,41 @@ pub struct WebhookStatus {
     pub running: bool,
     pub port: u16,
     pub url: String,
+    #[serde(default)]
+    pub public_url: String,
+    #[serde(default)]
+    pub tunnel_running: bool,
+    #[serde(default)]
+    pub tunnel_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseSnapshot {
+    pub request_id: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    pub encoding: String,
+    pub content_type: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    pub plan: String,
+    pub git_folder: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSyncResult {
+    pub folder: String,
+    pub imported: bool,
+    pub exported: bool,
+    pub changed: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

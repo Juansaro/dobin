@@ -218,6 +218,41 @@ export interface WebhookStatus {
   running: boolean;
   port: number;
   url: string;
+  publicUrl?: string;
+  tunnelRunning?: boolean;
+  tunnelError?: string;
+}
+
+export interface ResponseSnapshot {
+  requestId: string;
+  status: number;
+  headers: [string, string][];
+  body: string;
+  encoding: BodyEncoding;
+  contentType: string | null;
+  at: string;
+}
+
+export interface AppSettings {
+  plan: "local" | "pro";
+  gitFolder: string;
+}
+
+export interface GitSyncResult {
+  folder: string;
+  imported: boolean;
+  exported: boolean;
+  changed: boolean;
+  message: string;
+}
+
+export interface EnvCompareResult {
+  envAId: string;
+  envBId: string;
+  resultA: HttpSendResult;
+  resultB: HttpSendResult;
+  assertionsA: AssertionResult[];
+  assertionsB: AssertionResult[];
 }
 
 export interface OauthTokens {

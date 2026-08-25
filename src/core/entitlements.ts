@@ -15,11 +15,23 @@ export interface Entitlements {
   can(feature: FeatureId): boolean;
 }
 
-export const localUnlimited: Entitlements = {
-  plan: "local",
-  can: () => true,
-};
+export function normalizePlan(value: string | null | undefined): PlanId {
+  return value === "pro" ? "pro" : "local";
+}
 
-export function getEntitlements(): Entitlements {
-  return localUnlimited;
+export function entitlementsFor(plan: PlanId): Entitlements {
+  if (plan === "enterprise") {
+    return { plan, can: () => true };
+  }
+  if (plan === "pro") {
+    return {
+      plan,
+      can: (feature) => feature === Features.WebhooksPublicTunnel,
+    };
+  }
+  return { plan: "local", can: () => false };
+}
+
+export function getEntitlements(plan: PlanId = "local"): Entitlements {
+  return entitlementsFor(plan);
 }

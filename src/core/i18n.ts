@@ -14,7 +14,7 @@ const es = {
   "request.body": "Body",
   "request.auth": "Auth",
   "response.empty": "La respuesta aparecerá aquí",
-  "plans.current": "Tu plan: Local (ilimitado)",
+  "plans.current": "Tu plan: Local",
   "plans.soon": "Próximamente",
 } as const;
 

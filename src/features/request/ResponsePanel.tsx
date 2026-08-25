@@ -6,20 +6,25 @@ import {
   prettyBody,
   statusTone,
 } from "@/lib/utils";
-import type { AssertionResult, HttpSendResult, Timings } from "@/core/types";
+import type { AssertionResult, HttpSendResult, ResponseSnapshot, Timings } from "@/core/types";
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/ui/button";
+import { DiffView } from "./DiffView";
 
-type Tab = "pretty" | "raw" | "hex" | "headers" | "timings";
+type Tab = "pretty" | "raw" | "hex" | "headers" | "timings" | "diff";
 
 export function ResponsePanel({
   result,
   sending,
   assertionResults,
+  previousSnapshot,
+  label,
 }: {
   result: HttpSendResult | null;
   sending: boolean;
   assertionResults: AssertionResult[];
+  previousSnapshot?: ResponseSnapshot | null;
+  label?: string;
 }) {
   const [tab, setTab] = useState<Tab>("pretty");
   const bytes = useMemo(
@@ -70,7 +75,7 @@ export function ResponsePanel({
     <section className="flex min-h-[220px] flex-1 flex-col border-t border-line bg-panel">
       <div className="flex items-center justify-between border-b border-line px-3 py-2">
         <div className="flex flex-wrap items-center gap-3 text-[13px]">
-          <span className="text-muted">Respuesta</span>
+          <span className="text-muted">{label ?? "Respuesta"}</span>
           {result?.status ? (
             <span className={statusTone(result.status)}>
               {result.status} {result.statusText}
@@ -89,7 +94,7 @@ export function ResponsePanel({
           ) : null}
         </div>
         <div className="flex items-center gap-1">
-          {(["pretty", "raw", "hex", "headers", "timings"] as const).map((id) => (
+          {(["pretty", "raw", "hex", "headers", "timings", "diff"] as const).map((id) => (
             <button
               key={id}
               onClick={() => setTab(id)}
@@ -97,7 +102,7 @@ export function ResponsePanel({
                 tab === id ? "bg-panel-2 text-foreground" : "text-muted"
               }`}
             >
-              {id}
+              {id === "diff" ? "Diff" : id}
             </button>
           ))}
           {result ? (
@@ -148,6 +153,15 @@ export function ResponsePanel({
                 </pre>
               ) : tab === "timings" ? (
                 <TimingsView timings={result.timings} />
+              ) : tab === "diff" ? (
+                <DiffView
+                  left={previousSnapshot?.body ?? null}
+                  right={textBody}
+                  leftEncoding={previousSnapshot?.encoding}
+                  rightEncoding={result.bodyEncoding}
+                  leftType={previousSnapshot?.contentType}
+                  rightType={result.contentType}
+                />
               ) : tab === "hex" ? (
                 <pre className="font-mono text-[12px] leading-5">
                   {bytes ? hexDump(bytes) : ""}
