@@ -1,0 +1,38 @@
+[package]
+name = "opendobin"
+version = "0.1.0"
+description = "Cliente HTTP local-first para probar APIs y webhooks"
+authors = ["openDobin"]
+edition = "2021"
+
+[lib]
+name = "opendobin_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+parking_lot = "0.12"
+url = "2"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+http = "1"
