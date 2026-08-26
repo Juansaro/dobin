@@ -15,7 +15,19 @@ import { Button } from "@/ui/button";
 import { methodTone } from "@/lib/utils";
 import { runCollectionExport, runCollectionImport } from "./file-actions";
 import { KeyValueEditor } from "@/features/request/KeyValueEditor";
-import { Modal } from "@/ui/badge";
+import { ConfirmDialog, Modal, PromptDialog } from "@/ui/modal";
+
+type PromptState = {
+  title: string;
+  value: string;
+  onSubmit: (value: string) => void;
+};
+
+type ConfirmState = {
+  title: string;
+  message: string;
+  onConfirm: () => void;
+};
 
 export function CollectionTree() {
   const collections = useAppStore((s) => s.collections);
@@ -36,10 +48,15 @@ export function CollectionTree() {
   const saveCollectionVariables = useAppStore((s) => s.saveCollectionVariables);
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [varsOf, setVarsOf] = useState<Collection | null>(null);
+  const [prompt, setPrompt] = useState<PromptState | null>(null);
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
   function promptFolder(collectionId: string, parentId: string | null) {
-    const name = window.prompt("Nombre de la carpeta", "Nueva carpeta");
-    if (name?.trim()) void createFolder(collectionId, parentId, name.trim());
+    setPrompt({
+      title: "Nombre de la carpeta",
+      value: "Nueva carpeta",
+      onSubmit: (name) => void createFolder(collectionId, parentId, name),
+    });
   }
 
   return (
@@ -61,10 +78,13 @@ export function CollectionTree() {
             size="icon"
             variant="ghost"
             title="Nueva colección"
-            onClick={() => {
-              const name = window.prompt("Nombre de la colección", "Nueva colección");
-              if (name?.trim()) void createCollection(name.trim());
-            }}
+            onClick={() =>
+              setPrompt({
+                title: "Nombre de la colección",
+                value: "Nueva colección",
+                onSubmit: (name) => void createCollection(name),
+              })
+            }
           >
             <FolderPlus className="h-4 w-4" />
           </Button>
@@ -83,10 +103,13 @@ export function CollectionTree() {
                   onClick={() =>
                     setOpen((prev) => ({ ...prev, [collection.id]: !expanded }))
                   }
-                  onDoubleClick={() => {
-                    const name = window.prompt("Renombrar colección", collection.name);
-                    if (name?.trim()) void renameCollection(collection.id, name.trim());
-                  }}
+                  onDoubleClick={() =>
+                    setPrompt({
+                      title: "Renombrar colección",
+                      value: collection.name,
+                      onSubmit: (name) => void renameCollection(collection.id, name),
+                    })
+                  }
                 >
                   <ChevronRight
                     className={`h-3.5 w-3.5 text-muted transition-transform ${
@@ -135,11 +158,13 @@ export function CollectionTree() {
                   size="icon"
                   variant="ghost"
                   className="h-6 w-6"
-                  onClick={() => {
-                    if (window.confirm(`¿Borrar “${collection.name}”?`)) {
-                      void deleteCollection(collection.id);
-                    }
-                  }}
+                  onClick={() =>
+                    setConfirm({
+                      title: "Borrar colección",
+                      message: `¿Borrar “${collection.name}”?`,
+                      onConfirm: () => void deleteCollection(collection.id),
+                    })
+                  }
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </Button>
@@ -157,8 +182,20 @@ export function CollectionTree() {
                   selectRequest={selectRequest}
                   createRequest={createRequest}
                   promptFolder={promptFolder}
-                  renameFolder={renameFolder}
-                  deleteFolder={deleteFolder}
+                  onRenameFolder={(id, name) =>
+                    setPrompt({
+                      title: "Renombrar carpeta",
+                      value: name,
+                      onSubmit: (next) => void renameFolder(id, next),
+                    })
+                  }
+                  onDeleteFolder={(id, name) =>
+                    setConfirm({
+                      title: "Borrar carpeta",
+                      message: `¿Borrar “${name}”? Los requests pasan al padre.`,
+                      onConfirm: () => void deleteFolder(id),
+                    })
+                  }
                   deleteRequest={deleteRequest}
                 />
               ) : null}
@@ -187,6 +224,21 @@ export function CollectionTree() {
           />
         ) : null}
       </Modal>
+      <PromptDialog
+        key={prompt ? `${prompt.title}:${prompt.value}` : "prompt-closed"}
+        open={Boolean(prompt)}
+        title={prompt?.title ?? ""}
+        defaultValue={prompt?.value ?? ""}
+        onClose={() => setPrompt(null)}
+        onSubmit={(value) => prompt?.onSubmit(value)}
+      />
+      <ConfirmDialog
+        open={Boolean(confirm)}
+        title={confirm?.title ?? ""}
+        message={confirm?.message ?? ""}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => confirm?.onConfirm()}
+      />
     </div>
   );
 }
@@ -203,8 +255,8 @@ function TreeBranch({
   selectRequest,
   createRequest,
   promptFolder,
-  renameFolder,
-  deleteFolder,
+  onRenameFolder,
+  onDeleteFolder,
   deleteRequest,
 }: {
   collectionId: string;
@@ -218,8 +270,8 @@ function TreeBranch({
   selectRequest: (id: string) => void;
   createRequest: (collectionId: string, folderId?: string | null) => Promise<void>;
   promptFolder: (collectionId: string, parentId: string | null) => void;
-  renameFolder: (id: string, name: string) => Promise<void>;
-  deleteFolder: (id: string) => Promise<void>;
+  onRenameFolder: (id: string, name: string) => void;
+  onDeleteFolder: (id: string, name: string) => void;
   deleteRequest: (id: string) => Promise<void>;
 }) {
   const childFolders = folders
@@ -244,10 +296,7 @@ function TreeBranch({
                 onClick={() =>
                   setOpen((prev) => ({ ...prev, [folder.id]: !expanded }))
                 }
-                onDoubleClick={() => {
-                  const name = window.prompt("Renombrar carpeta", folder.name);
-                  if (name?.trim()) void renameFolder(folder.id, name.trim());
-                }}
+                onDoubleClick={() => onRenameFolder(folder.id, folder.name)}
               >
                 <ChevronRight
                   className={`h-3.5 w-3.5 text-muted transition-transform ${
@@ -280,15 +329,7 @@ function TreeBranch({
                 variant="ghost"
                 className="h-6 w-6 opacity-0 group-hover:opacity-100"
                 title="Borrar carpeta"
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      `¿Borrar “${folder.name}”? Los requests pasan al padre.`,
-                    )
-                  ) {
-                    void deleteFolder(folder.id);
-                  }
-                }}
+                onClick={() => onDeleteFolder(folder.id, folder.name)}
               >
                 <Trash2 className="h-3 w-3" />
               </Button>
@@ -306,8 +347,8 @@ function TreeBranch({
                 selectRequest={selectRequest}
                 createRequest={createRequest}
                 promptFolder={promptFolder}
-                renameFolder={renameFolder}
-                deleteFolder={deleteFolder}
+                onRenameFolder={onRenameFolder}
+                onDeleteFolder={onDeleteFolder}
                 deleteRequest={deleteRequest}
               />
             ) : null}

@@ -259,8 +259,12 @@ async function memoryInvoke<T>(
       return undefined as T;
     case "http_send":
       return browserSend(args.payload as HttpSendPayload) as T;
-    case "http_cancel":
+    case "http_cancel": {
+      const id = String(args.id ?? "");
+      cancelledSends.add(id);
+      browserCancels.get(id)?.abort();
       return undefined as T;
+    }
     case "oauth_authorize":
     case "oauth_client_credentials":
       throw new Error("OAuth solo está disponible en la app de escritorio.");
@@ -387,6 +391,9 @@ function storeSetCookies(url: string, headers: [string, string][]) {
   }
 }
 
+const browserCancels = new Map<string, AbortController>();
+const cancelledSends = new Set<string>();
+
 async function browserSend(payload: HttpSendPayload): Promise<HttpSendResult> {
   const started = performance.now();
   let url = payload.url;
@@ -420,13 +427,16 @@ async function browserSend(payload: HttpSendPayload): Promise<HttpSendResult> {
     const token = auth.accessToken || auth.token;
     if (token) headers.set("Authorization", `Bearer ${token}`);
   }
+  const controller = new AbortController();
+  browserCancels.set(payload.id, controller);
+  const timer = window.setTimeout(() => controller.abort(), payload.timeoutMs);
   try {
     const res = await fetch(url, {
       method: payload.method,
       headers,
       body: payload.body,
       redirect: payload.followRedirects ? "follow" : "manual",
-      signal: AbortSignal.timeout(payload.timeoutMs),
+      signal: controller.signal,
     });
     const body = await res.text();
     const durationMs = Math.round(performance.now() - started);
@@ -459,10 +469,15 @@ async function browserSend(payload: HttpSendPayload): Promise<HttpSendResult> {
     };
   } catch (error) {
     const durationMs = Math.round(performance.now() - started);
+    const cancelled = cancelledSends.has(payload.id);
     return {
       ok: false,
-      cancelled: false,
-      error: error instanceof Error ? error.message : String(error),
+      cancelled,
+      error: cancelled
+        ? "Cancelado"
+        : error instanceof Error
+          ? error.message
+          : String(error),
       status: null,
       statusText: null,
       headers: [],
@@ -473,6 +488,10 @@ async function browserSend(payload: HttpSendPayload): Promise<HttpSendResult> {
       bodyEncoding: "utf8",
       timings: emptyTimings(durationMs),
     };
+  } finally {
+    window.clearTimeout(timer);
+    browserCancels.delete(payload.id);
+    cancelledSends.delete(payload.id);
   }
 }
 

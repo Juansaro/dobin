@@ -28,8 +28,11 @@ import {
   createRequest,
   emptyAuth,
   hydrateRequest,
+  METHODS,
   PERSONAL_WORKSPACE_ID,
+  type HttpMethod,
 } from "@/core/types";
+import { toast } from "sonner";
 import { entitlementsFor, normalizePlan, Features, type PlanId } from "@/core/entitlements";
 import { requestFromWebhook } from "@/core/replay";
 import {
@@ -66,6 +69,7 @@ interface AppState {
   draft: HttpRequestRecord | null;
   dirty: boolean;
   sending: boolean;
+  sendKind: "idle" | "single" | "compare";
   sendId: string | null;
   response: HttpSendResult | null;
   assertionResults: AssertionResult[];
@@ -374,6 +378,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   draft: null,
   dirty: false,
   sending: false,
+  sendKind: "idle",
   sendId: null,
   response: null,
   assertionResults: [],
@@ -748,7 +753,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().acceptInvalidCerts,
     );
     const sendId = crypto.randomUUID();
-    set({ sending: true, sendId, response: null, assertionResults: [], compare: null });
+    set({
+      sending: true,
+      sendKind: "single",
+      sendId,
+      response: null,
+      assertionResults: [],
+      compare: null,
+    });
     const previous = await api<ResponseSnapshot | null>("snapshot_get", {
       id: draft.id,
     });
@@ -778,6 +790,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const current = get().draft;
     set({
       sending: false,
+      sendKind: "idle",
       sendId: null,
       response: result,
       lastSnapshot: previous,
@@ -834,18 +847,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       : undefined;
     if (match) {
       get().selectRequest(match.id);
+    } else if (!get().draft) {
       return;
+    } else {
+      set({ view: "request" });
     }
     const draft = get().draft;
     if (!draft) return;
-    set({
-      draft: {
-        ...draft,
-        method: entry.method as HttpRequestRecord["method"],
-        url: entry.url,
-      },
-      dirty: true,
-      view: "request",
+    const method = METHODS.includes(entry.method as HttpMethod)
+      ? (entry.method as HttpMethod)
+      : draft.method;
+    if (draft.method === method && draft.url === entry.url) return;
+    get().patchDraft({ method, url: entry.url });
+    toast.message("URL de esa ejecución", {
+      description: "No está guardada. Pulsa Guardar si quieres conservarla.",
     });
   },
 
@@ -1020,75 +1035,103 @@ export const useAppStore = create<AppState>((set, get) => ({
     const varsA = varsForEnvironment(get(), envAId);
     const varsB = varsForEnvironment(get(), envBId);
     const sendIdA = crypto.randomUUID();
-    set({ sending: true, sendId: sendIdA, compare: null });
-    const resultA = await api<HttpSendResult>("http_send", {
-      payload: {
-        ...assembledSend(
-          draft,
-          varsA,
-          get().timeoutMs,
-          get().followRedirects,
-          get().acceptInvalidCerts,
-        ),
-        id: sendIdA,
-      },
-    });
-    const sendIdB = crypto.randomUUID();
-    set({ sendId: sendIdB });
-    const resultB = await api<HttpSendResult>("http_send", {
-      payload: {
-        ...assembledSend(
-          draft,
-          varsB,
-          get().timeoutMs,
-          get().followRedirects,
-          get().acceptInvalidCerts,
-        ),
-        id: sendIdB,
-      },
-    });
-    if (activeId === envAId && resultA.status === 200 && !resultA.truncated) {
-      await api("snapshot_put", {
-        snapshot: {
-          requestId: draft.id,
-          status: 200,
-          headers: resultA.headers,
-          body: resultA.body,
-          encoding: resultA.bodyEncoding,
-          contentType: resultA.contentType,
-          at: new Date().toISOString(),
+    set({ sending: true, sendKind: "compare", sendId: sendIdA, compare: null });
+    try {
+      const resultA = await api<HttpSendResult>("http_send", {
+        payload: {
+          ...assembledSend(
+            draft,
+            varsA,
+            get().timeoutMs,
+            get().followRedirects,
+            get().acceptInvalidCerts,
+          ),
+          id: sendIdA,
         },
       });
-    } else if (activeId === envBId && resultB.status === 200 && !resultB.truncated) {
-      await api("snapshot_put", {
-        snapshot: {
-          requestId: draft.id,
-          status: 200,
-          headers: resultB.headers,
-          body: resultB.body,
-          encoding: resultB.bodyEncoding,
-          contentType: resultB.contentType,
-          at: new Date().toISOString(),
+      if (resultA.cancelled) {
+        set({ sending: false, sendKind: "idle", sendId: null });
+        return;
+      }
+      const sendIdB = crypto.randomUUID();
+      set({ sendId: sendIdB });
+      const resultB = await api<HttpSendResult>("http_send", {
+        payload: {
+          ...assembledSend(
+            draft,
+            varsB,
+            get().timeoutMs,
+            get().followRedirects,
+            get().acceptInvalidCerts,
+          ),
+          id: sendIdB,
         },
       });
+      if (resultB.cancelled) {
+        set({ sending: false, sendKind: "idle", sendId: null });
+        return;
+      }
+      if (activeId === envAId && resultA.status === 200 && !resultA.truncated) {
+        await api("snapshot_put", {
+          snapshot: {
+            requestId: draft.id,
+            status: 200,
+            headers: resultA.headers,
+            body: resultA.body,
+            encoding: resultA.bodyEncoding,
+            contentType: resultA.contentType,
+            at: new Date().toISOString(),
+          },
+        });
+      } else if (activeId === envBId && resultB.status === 200 && !resultB.truncated) {
+        await api("snapshot_put", {
+          snapshot: {
+            requestId: draft.id,
+            status: 200,
+            headers: resultB.headers,
+            body: resultB.body,
+            encoding: resultB.bodyEncoding,
+            contentType: resultB.contentType,
+            at: new Date().toISOString(),
+          },
+        });
+      }
+      const history = await api<HistoryEntry[]>("history_list");
+      set({
+        sending: false,
+        sendKind: "idle",
+        sendId: null,
+        history,
+        compare: {
+          envAId,
+          envBId,
+          resultA,
+          resultB,
+          assertionsA: runAssertions(draft.tests ?? [], resultA, varsA),
+          assertionsB: runAssertions(draft.tests ?? [], resultB, varsB),
+        },
+      });
+    } catch (error) {
+      set({ sending: false, sendKind: "idle", sendId: null });
+      throw error;
     }
-    const history = await api<HistoryEntry[]>("history_list");
-    set({
-      sending: false,
-      sendId: null,
-      history,
-      compare: {
-        envAId,
-        envBId,
-        resultA,
-        resultB,
-        assertionsA: runAssertions(draft.tests ?? [], resultA, varsA),
-        assertionsB: runAssertions(draft.tests ?? [], resultB, varsB),
-      },
-    });
   },
 
-  clearCompare: () => set({ compare: null }),
+  clearCompare: () => {
+    const current = get().compare;
+    if (!current) {
+      set({ compare: null });
+      return;
+    }
+    const activeId =
+      get().environments.find((item) => item.isActive)?.id ?? get().environments[0]?.id;
+    const useB = activeId === current.envBId;
+    set({
+      compare: null,
+      response: useB ? current.resultB : current.resultA,
+      assertionResults: useB ? current.assertionsB : current.assertionsA,
+    });
+  },
 
   exportCollection: (id) => {
     const { collections, requests, folders, environments } = get();

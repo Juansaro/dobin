@@ -8,7 +8,7 @@ import { methodTone, prettyBody } from "@/lib/utils";
 import { toast } from "sonner";
 import { Features, getEntitlements } from "@/core/entitlements";
 import { replayUrl } from "@/core/replay";
-import { Modal } from "@/ui/badge";
+import { Modal } from "@/ui/modal";
 
 export function WebhookInbox() {
   const status = useAppStore((s) => s.webhookStatus);

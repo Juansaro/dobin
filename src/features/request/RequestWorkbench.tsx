@@ -15,7 +15,7 @@ import { ResponsePanel } from "./ResponsePanel";
 import { TestsEditor } from "./TestsEditor";
 import { PreRequestEditor } from "./PreRequestEditor";
 import { DiffView } from "./DiffView";
-import { Modal } from "@/ui/badge";
+import { Modal } from "@/ui/modal";
 
 const tabs = ["params", "headers", "body", "auth", "pre", "tests"] as const;
 type Tab = (typeof tabs)[number];
@@ -36,6 +36,7 @@ export function RequestWorkbench() {
   const cancel = useAppStore((s) => s.cancel);
   const saveDraft = useAppStore((s) => s.saveDraft);
   const sending = useAppStore((s) => s.sending);
+  const sendKind = useAppStore((s) => s.sendKind);
   const dirty = useAppStore((s) => s.dirty);
   const response = useAppStore((s) => s.response);
   const timeoutMs = useAppStore((s) => s.timeoutMs);
@@ -56,6 +57,10 @@ export function RequestWorkbench() {
   const [compareOpen, setCompareOpen] = useState(false);
   const [envA, setEnvA] = useState("");
   const [envB, setEnvB] = useState("");
+
+  useEffect(() => {
+    if (compare) setCompareOpen(false);
+  }, [compare]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -102,12 +107,14 @@ export function RequestWorkbench() {
           placeholder="https://api.ejemplo.com/v1/recurso"
           className="font-mono"
         />
-        {sending ? (
+        {sending && sendKind === "single" ? (
           <Button variant="outline" onClick={() => void cancel()}>
             Cancelar
           </Button>
         ) : (
-          <Button onClick={() => void send()}>Enviar</Button>
+          <Button disabled={sending} onClick={() => void send()}>
+            Enviar
+          </Button>
         )}
         <Button variant={dirty ? "default" : "outline"} onClick={() => void saveDraft()}>
           Guardar
@@ -316,24 +323,37 @@ export function RequestWorkbench() {
       <Modal
         open={compareOpen}
         title="Comparar entornos"
-        onClose={() => setCompareOpen(false)}
+        onClose={() => {
+          if (sendKind === "compare") return;
+          setCompareOpen(false);
+        }}
         footer={
-          <>
-            <Button variant="ghost" onClick={() => setCompareOpen(false)}>
-              Cancelar
-            </Button>
-            <Button
-              disabled={!envA || !envB || envA === envB || sending}
-              onClick={() => {
-                setCompareOpen(false);
-                void compareEnvironments(envA, envB).catch((err: Error) =>
-                  toast.error(err.message),
-                );
-              }}
-            >
-              Enviar a ambos
-            </Button>
-          </>
+          sendKind === "compare" ? (
+            <>
+              <span className="mr-auto self-center text-xs text-muted">
+                Comparando…
+              </span>
+              <Button variant="outline" onClick={() => void cancel()}>
+                Cancelar
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" onClick={() => setCompareOpen(false)}>
+                Cancelar
+              </Button>
+              <Button
+                disabled={!envA || !envB || envA === envB || sending}
+                onClick={() => {
+                  void compareEnvironments(envA, envB).catch((err: Error) =>
+                    toast.error(err.message),
+                  );
+                }}
+              >
+                Enviar a ambos
+              </Button>
+            </>
+          )
         }
       >
         <p className="mb-3 text-xs text-muted">

@@ -9,7 +9,7 @@ import { parseCurl, toCurl } from "@/core/curl";
 import { runCollectionExport, runCollectionImport } from "@/features/collections/file-actions";
 import { toast } from "sonner";
 import { Textarea } from "@/ui/input";
-import { Modal } from "@/ui/badge";
+import { Modal } from "@/ui/modal";
 import { Features, getEntitlements } from "@/core/entitlements";
 export function SettingsView() {
   const environments = useAppStore((s) => s.environments);
